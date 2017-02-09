@@ -292,11 +292,11 @@ For example, here is the test `NewHadoopAPI`.
   }
 ```
 
-This test can be executed as part of the suite `S3aIOSuite`, by setting the `suites` maven property to the classname
+This test can be executed as part of the suite `S3ABasicIOSuite`, by setting the `suites` maven property to the classname
 of the test suite:
 
 ```
-mvn test -Dcloud.test.configuration.file=/home/developer/aws/cloud.xml -Dsuites=com.hortonworks.sparkspark.cloud.s3.S3AIOSuite
+mvn test -Dcloud.test.configuration.file=/home/developer/aws/cloud.xml -Dsuites=com.hortonworks.spark.cloud.s3.S3ABasicIOSuite
 ```
 
 If the test configuration in `/home/developer/aws/cloud.xml` does not have the property
@@ -307,10 +307,10 @@ A single test can be explicitly run by including the key in the `suites` propert
 after the suite name
 
 ```
-mvn test -Dcloud.test.configuration.file=/home/developer/aws/cloud.xml `-Dsuites=com.hortonworks.spark.cloud.s3.S3AIOSuite NewHadoopAPI`
+mvn test -Dcloud.test.configuration.file=/home/developer/aws/cloud.xml `-Dsuites=com.hortonworks.spark.cloud.s3.S3ABasicIOSuite NewHadoopAPI`
 ```
 
-This will run all tests in the `S3AIOSuite` suite whose name contains the string `NewHadoopAPI`;
+This will run all tests in the `S3ABasicIOSuite` suite whose name contains the string `NewHadoopAPI`;
 here just one test. Again, the test will be skipped if the `cloud.xml` configuration file does
 not enable s3a tests.
 
@@ -421,4 +421,63 @@ mvn test -T 1C -Dspark.version=2.0.0.2.5.0.14-5 \
   -Dspark.cloud.jar=spark-cloud \
   -Pdeclare-http-components \
   -Dcentral.repo=http://PRIVATE-REPO/nexus/content/ 
+```
+
+### Testing against S3Guard
+
+The S3Guard extension to the Hadoop S3A filesytem uses Amazon's DynamoDB to implement
+a consistent metadatastore with high performance access. This makes reading file metadata,
+including listing directories, significantly faster. 
+
+
+To test against s3guard
+
+1. Build spark against this version of Hadoop
+1. in `cloud.xml`, add the configuration options for testing
+
+```xml
+
+<property>
+  <name>fs.s3a.metadatastore.impl</name>
+  <value>org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore</value>
+</property>
+
+<property>
+  <name>fs.s3a.s3guard.ddb.table.create</name>
+  <value>true</value>
+  <description>
+    If true, the S3A client will create the table if it does not already exist.
+  </description>
+</property>
+
+<property>
+  <name>fs.s3a.s3guard.ddb.table.capacity.read</name>
+  <value>10</value>
+  <description>
+    Provisioned throughput requirements for read operations in terms of capacity
+    units for the DynamoDB table. This config value will only be used when
+    creating a new DynamoDB table, though later you can manually provision by
+    increasing or decreasing read capacity as needed for existing tables.
+    See DynamoDB documents for more information.
+  </description>
+</property>
+
+<property>
+  <name>fs.s3a.s3guard.ddb.table.capacity.write</name>
+  <value>10</value>
+  <description>
+    Provisioned throughput requirements for write operations in terms of
+    capacity units for the DynamoDB table. Refer to related config
+    fs.s3a.s3guard.ddb.table.capacity.read before usage.
+  </description>
+</property>
+
+<property>
+  <name>fs.s3a.bucket.landsat-pds.metadatastore.impl</name>
+  <value>org.apache.hadoop.fs.s3a.s3guard.NullMetadataStore</value>
+  <description>The read-only landsat-pds repository isn't
+  managed by s3guard</description>
+</property>
+
+
 ```
