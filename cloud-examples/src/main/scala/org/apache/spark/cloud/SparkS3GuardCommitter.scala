@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package com.hortonworks.spark.cloud.commit
+package org.apache.spark.cloud
 
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -24,37 +24,36 @@ import java.util.{Date, Locale}
 import scala.collection.mutable
 
 import com.google.common.base.Preconditions
-import com.hortonworks.spark.cloud.CloudLogging
-import org.apache.hadoop.conf.{Configurable, Configuration}
+import com.hortonworks.spark.cloud.{CloudLogging, TimeOperations}
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
-import org.apache.hadoop.mapreduce.{JobContext, JobStatus, OutputCommitter, TaskAttemptContext, TaskAttemptID, TaskID, TaskType}
-import org.apache.hadoop.fs.s3a._
 import org.apache.hadoop.fs.s3a.Constants._
+import org.apache.hadoop.fs.s3a._
 import org.apache.hadoop.fs.s3a.commit._
 import org.apache.hadoop.mapred.{JobConf, JobID}
 import org.apache.hadoop.mapreduce.lib.output._
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
-import org.apache.hadoop.mapreduce.{TaskAttemptContext => MapReduceTaskAttemptContext}
-import org.apache.hadoop.mapreduce.{OutputCommitter => MapReduceOutputCommitter}
+import org.apache.hadoop.mapreduce.{JobContext, JobStatus, TaskAttemptContext, TaskAttemptID, TaskID, TaskType, TaskAttemptContext => MapReduceTaskAttemptContext}
 
 import org.apache.spark.executor.CommitDeniedException
-import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.internal.io.FileCommitProtocol
+import org.apache.spark.{SparkEnv, TaskContext}
 
 class SparkS3GuardCommitter(jobId: String, dest: String)
   extends FileCommitProtocol
     with Serializable
+    with TimeOperations
     with CloudLogging {
 
   import FileCommitProtocol._
 
   /** Path is actually Serializable in Hadoop 3, but left alone for ease of
    * backporting this committer. */
-  @transient private var destPath = new Path(dest)
-  @transient private var workPath: Path = null
-  @transient private var destFS: S3AFileSystem = null
-  @transient private var commitActions: FileCommitActions = null
-  @transient private var committer: S3AOutputCommitter = _
+  @transient private val destPath = new Path(dest)
+  @transient private var workPath: Path = _
+  @transient private var destFS: S3AFileSystem = _
+  @transient private var commitActions: FileCommitActions = _
+  @transient private var committer: Option[S3AOutputCommitter] = None
 
   /**
    * Tracks files staged by this task for absolute output paths. These outputs are not managed by
@@ -68,10 +67,10 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
    * The staging directory for all files committed with absolute output paths.
    * This is the inefficient commit mechanism to be stringly discouraged
    */
-  private def absPathStagingDir: Path = new Path(dest, "_temporary-" + jobId)
+  private def absPathStagingDir: Path = new Path(dest, s"_temporary-$jobId")
 
   /**
-   * Get the FS of the specific conf and destPath as an S3aFS
+   * Get the FS of the specific conf and destPath as an S3aFS.
    *
    * @param jobContext job context
    * @return the FS instance
@@ -86,6 +85,8 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
       s"Filesystem of $destPath is not an S3AFileSystem: $fs")
     fs.asInstanceOf[S3AFileSystem]
   }
+
+  private val MR_COMMITTER = "mapreduce.pathoutputcommitter.factory.class"
 
   override def setupJob(jobContext: JobContext): Unit = {
     // Setup IDs
@@ -104,19 +105,20 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
     conf.set(FAST_UPLOAD_BUFFER, FAST_UPLOAD_BUFFER_ARRAY)
     conf.setBoolean(COMMITTER_ENABLED, true)
     // force in S3a committer
-    conf.set("mapreduce.pathoutputcommitter.factory.class",
-        S3AOutputCommitterFactory.NAME)
 
+    val committerFactoryClass = conf.get(MR_COMMITTER)
+    Preconditions.checkState(committerFactoryClass == S3AOutputCommitterFactory.NAME,
+      "MR Committer factory class set in " + MR_COMMITTER +
+     " is not the S3guard factory: " + S3AOutputCommitterFactory.NAME)
 
     val taskAttemptContext = new TaskAttemptContextImpl(conf, taskAttemptId)
-    committer = setupCommitter(taskAttemptContext)
-    committer.setupJob(jobContext)
+    committer = createCommitter(taskAttemptContext)
   }
 
   override def commitJob(jobContext: JobContext, taskCommits: Seq[TaskCommitMessage]): Unit = {
 
     logInfo(s"Commtting to $dest")
-    committer.commitJob(jobContext)
+    createCommitter(jobContext).commitJob(jobContext)
 
     val filesToMove = taskCommits.map(_.obj.asInstanceOf[Map[String, String]])
       .foldLeft(Map[String, String]())(_ ++ _)
@@ -124,29 +126,40 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
     logDebug(s"Committing files staged for absolute locations $filesToMove")
     val fs = getS3aFS(jobContext)
     for ((src, dst) <- filesToMove) {
-      fs.rename(new Path(src), new Path(dst))
+      val srcPath = new Path(src)
+      val destPath = new Path(dst)
+      duration(s"Rename $srcPath to $destPath") {
+        fs.rename(srcPath, destPath)
+      }
     }
-    fs.delete(absPathStagingDir, true)
+    deleteStagingDir(fs)
+  }
 
+  def deleteStagingDir(fs: S3AFileSystem): Unit = {
+    duration(s"Delete Staging Dir $absPathStagingDir") {
+      fs.delete(absPathStagingDir, true)
+    }
   }
 
   override def abortJob(jobContext: JobContext): Unit = {
     committer.abortJob(jobContext, JobStatus.State.FAILED)
-    val fs = getS3aFS(jobContext)
-    fs.delete(absPathStagingDir, true)
+    deleteStagingDir(getS3aFS(jobContext))
   }
 
   override def setupTask(taskContext: TaskAttemptContext): Unit = {
-    committer = setupCommitter(taskContext)
-    committer.setupTask(taskContext)
-
-    addedAbsPathFiles = mutable.Map[String, String]()
+    duration(s"Setting up task ${taskContext.getTaskAttemptID}") {
+      committer = createCommitter(taskContext)
+      committer.setupTask(taskContext)
+      addedAbsPathFiles = mutable.Map[String, String]()
+    }
   }
 
   override def newTaskTempFile(
       taskContext: TaskAttemptContext,
       dir: Option[String],
       ext: String): String = {
+
+    workPath
 
   }
 
@@ -157,16 +170,28 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
 
   }
 
+  /**
+   * Abort a task.
+   * @param taskContext task
+   */
   override def abortTask(taskContext: TaskAttemptContext): Unit = {
-    committer.abortTask(taskContext)
-    // best effort cleanup of other staged files
-    val fS = getS3aFS(taskContext)
-    for ((src, _) <- addedAbsPathFiles) {
-      fS.delete(new Path(src), false)
+    duration(s"Aborting task ${taskContext.getTaskAttemptID}"){
+      committer(taskContext).abortTask(taskContext)
+      // best effort cleanup of other staged files
+      val fS = getS3aFS(taskContext)
+      for ((src, _) <- addedAbsPathFiles) {
+        fS.delete(new Path(src), false)
+      }
     }
   }
 
-  protected def setupCommitter(context: TaskAttemptContext): S3AOutputCommitter = {
+  /**
+   * Creates an S3A output committer.
+   * @param context task context
+   * @return the committer
+   * @throws IllegalStateException if the committer is of a different type.
+   */
+  protected def createCommitter(context: TaskAttemptContext): S3AOutputCommitter = {
     val formatClass = context.getOutputFormatClass
     val format = formatClass.newInstance()
     Preconditions.checkState(format.isInstanceOf[FileOutputFormat],
@@ -177,6 +202,41 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
       s"Format class $formatClass has an output committer" +
         s" which is not an S3AOutputCommitter: $committer")
     committer.asInstanceOf[S3AOutputCommitter]
+  }
+
+  /**
+   * Creates an S3A output committer.
+   * @param context task context
+   * @return the committer
+   * @throws IllegalStateException if the committer is of a different type.
+   */
+  protected def createCommitter(context: JobContext): S3AOutputCommitter = {
+    val committerFactory = new S3AOutputCommitterFactory()
+    committerFactory.createOutputCommitter()
+    val formatClass = context.getOutputFormatClass
+    val format = formatClass.newInstance()
+    Preconditions.checkState(format.isInstanceOf[FileOutputFormat],
+      s"Unsupported file output format $formatClass")
+    val output = format.asInstanceOf[FileOutputFormat]
+    val committer = output.getOutputCommitter(context)
+    Preconditions.checkState(committer.isInstanceOf[S3AOutputCommitter],
+      s"Format class $formatClass has an output committer" +
+        s" which is not an S3AOutputCommitter: $committer")
+    committer.asInstanceOf[S3AOutputCommitter]
+  }
+
+  /**
+   * Get the committer. This either returns the existing one, or creates a new one
+   * @param context
+   * @return
+   */
+  protected def committer(context: TaskAttemptContext): S3AOutputCommitter = {
+    committer match {
+      case Some(c) => c
+      case None =>
+        committer = Some(createCommitter(context))
+        committer.get
+    }
   }
 
   def createJobID(time: Date, id: Int): JobID = {
@@ -217,7 +277,7 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
    * is set to true (which is the default).
    */
   def commitTask(
-      committer: MapReduceOutputCommitter,
+      committer: S3AOutputCommitter,
       mrTaskContext: MapReduceTaskAttemptContext,
       jobId: Int,
       splitId: Int): Unit = {
@@ -239,32 +299,19 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
 
     // First, check whether the task's output has already been committed by some other attempt
     if (committer.needsTaskCommit(mrTaskContext)) {
-      val shouldCoordinateWithDriver: Boolean = {
-        val sparkConf = SparkEnv.get.conf
-        // We only need to coordinate with the driver if there are concurrent task attempts.
-        // Note that this could happen even when speculation is not enabled (e.g. see SPARK-8029).
-        // This (undocumented) setting is an escape-hatch in case the commit code introduces bugs.
-        sparkConf.getBoolean("spark.hadoop.outputCommitCoordination.enabled", defaultValue = true)
-      }
+      val outputCommitCoordinator = SparkEnv.get.outputCommitCoordinator
+      val taskAttemptNumber = TaskContext.get().attemptNumber()
+      val canCommit = outputCommitCoordinator.canCommit(jobId, splitId, taskAttemptNumber)
 
-      if (shouldCoordinateWithDriver) {
-        val outputCommitCoordinator = SparkEnv.get.outputCommitCoordinator
-        val taskAttemptNumber = TaskContext.get().attemptNumber()
-        val canCommit = outputCommitCoordinator.canCommit(jobId, splitId, taskAttemptNumber)
-
-        if (canCommit) {
-          performCommit()
-        } else {
-          val message =
-            s"$mrTaskAttemptID: Not committed because the driver did not authorize commit"
-          logInfo(message)
-          // We need to abort the task so that the driver can reschedule new attempts, if necessary
-          committer.abortTask(mrTaskContext)
-          throw new CommitDeniedException(message, jobId, splitId, taskAttemptNumber)
-        }
-      } else {
-        // Speculation is disabled or a user has chosen to manually bypass the commit coordination
+      if (canCommit) {
         performCommit()
+      } else {
+        val message =
+          s"$mrTaskAttemptID: Not committed because the driver did not authorize commit"
+        logInfo(message)
+        // We need to abort the task so that the driver can reschedule new attempts, if necessary
+        committer.abortTask(mrTaskContext)
+        throw new CommitDeniedException(message, jobId, splitId, taskAttemptNumber)
       }
     } else {
       // Some other attempt committed the output, so we do nothing and signal success
@@ -273,3 +320,5 @@ class SparkS3GuardCommitter(jobId: String, dest: String)
   }
 
 }
+
+
