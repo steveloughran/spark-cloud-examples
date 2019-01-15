@@ -1,5 +1,8 @@
 # spark-cloud-examples
 
+
+# This has been archived. See [Spark Cloud integration](https://github.com/hortonworks-spark/cloud-integration)
+
 This does the packaging/integration tests for Spark and cloud against AWS, Azure and openstack.
 
 These are basic tests of the core functionality of I/O, streaming, using spark as a destination of work.
